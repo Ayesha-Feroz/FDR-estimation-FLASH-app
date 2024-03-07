@@ -1,0 +1,257 @@
+import os
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import altair as alt
+
+def generate_plots(combined_df, original_df, ppmtol):
+    try:
+        # Create the fdval dataframe by combining the ScanNum and MonoisotopicMass columns from the combined_df
+        fdval = combined_df[['ScanNum', 'MonoisotopicMass']]
+
+        # Convert the ScanNum column to integers
+        fdval['ScanNum'] = fdval['ScanNum'].astype(int)
+
+        # Create the tpindex1 logical index by checking if the values in the ScanNum column of fdval are present in the Scan column of original_df
+        tpindex1 = fdval['ScanNum'].isin(original_df['ScanNum'].dropna().replace([np.inf, -np.inf], np.nan).astype(int))
+
+        # Adjusted code to allow for ±1 Da error with user-defined ppmtol Da tolerance
+        tpindex2 = np.logical_or.reduce([
+            (fdval.iloc[:, 1].values[:, np.newaxis] >= original_df.iloc[:, 2].values - ppmtol / 10) &
+            (fdval.iloc[:, 1].values[:, np.newaxis] <= original_df.iloc[:, 2].values + ppmtol / 10),
+            (fdval.iloc[:, 1].values[:, np.newaxis] >= original_df.iloc[:, 2].values - (ppmtol + 1) / 10) &
+            (fdval.iloc[:, 1].values[:, np.newaxis] <= original_df.iloc[:, 2].values - (ppmtol - 1) / 10),
+            (fdval.iloc[:, 1].values[:, np.newaxis] >= original_df.iloc[:, 2].values + (ppmtol - 1) / 10) &
+            (fdval.iloc[:, 1].values[:, np.newaxis] <= original_df.iloc[:, 2].values + (ppmtol + 1) / 10)
+        ])
+
+        # Create the tpindex logical index by combining tpindex1, tpindex2, and the DummyIndex column from combined_df with values of 0
+        tpindex = np.logical_and.reduce((
+            tpindex1.values.flatten(),
+            tpindex2.any(axis=1),
+            combined_df['TargetDecoyType'].values == 0
+        ))
+
+        # Identify false positives and decoys
+        fpindex = np.logical_and.reduce((
+            np.logical_not(tpindex),
+            combined_df['TargetDecoyType'].values == 0
+        ))
+        decoyindex = combined_df['TargetDecoyType'] > 0
+
+        # Identify true positives, false positives, and decoys
+        true_positives = combined_df.loc[tpindex]
+        false_positives = combined_df.loc[fpindex]
+        decoy_masses = combined_df.loc[decoyindex]
+
+        # Count the number of instances for each category
+        tp_count = len(true_positives)
+        fp_count = len(false_positives)
+        decoy_count = len(decoy_masses)
+
+        # Plotting the histograms, ECDF, and KDE
+        st.subheader('Histogram of Qscore')
+        fig_hist = plt.figure(figsize=(8, 6))
+        plt.hist(combined_df.loc[fpindex, 'Qscore'], bins=100, alpha=0.7, label='False Positive Masses', color='red',
+                 edgecolor='grey')
+        plt.hist(combined_df.loc[tpindex, 'Qscore'], bins=100, alpha=0.6, label='True Positive Masses', color='green',
+                 edgecolor='grey')
+        plt.hist(combined_df.loc[decoyindex, 'Qscore'], bins=100, alpha=0.4, label='Decoy Masses', color='blue',
+                 edgecolor='grey')
+        plt.xlabel('Qscore')
+        plt.ylabel('Count')
+        plt.legend()
+        plt.grid(True)
+        st.pyplot(fig_hist)
+
+        st.subheader('Empirical Cumulative Distribution Function')
+        fig_ecdf = plt.figure(figsize=(10, 6))
+        sns.ecdfplot(data=combined_df.loc[tpindex, 'Qscore'], label='True Positive Masses', color='green')
+        sns.ecdfplot(data=combined_df.loc[fpindex, 'Qscore'], label='False Positive Masses', color='red')
+        sns.ecdfplot(data=combined_df.loc[decoyindex, 'Qscore'], label='Decoy Masses', color='blue')
+        plt.xlabel('Qscore')
+        plt.ylabel('ECDF')
+        plt.legend()
+        plt.grid(True)
+        st.pyplot(fig_ecdf)
+
+        def altair_scatter_plot(data):
+            # Define the color scheme for different types of points
+            color_scale = alt.Scale(domain=['True Positives', 'False Positives', 'Decoys'],
+                                    range=['green', 'red', 'blue'])
+
+            # Create the scatter plot
+            scatter_chart = alt.Chart(data).mark_circle(size=60).encode(
+                x='ScanNum',
+                y='MonoisotopicMass',
+                color=alt.Color('Type', scale=color_scale),
+                tooltip=['ScanNum', 'MonoisotopicMass', 'Type']
+            ).interactive()
+
+            # Display the chart in Streamlit``
+            st.altair_chart(scatter_chart, use_container_width=True)
+
+        st.subheader('Kernel Density Estimate')
+        fig_kde = plt.figure(figsize=(10, 6))
+        sns.kdeplot(data=combined_df.loc[tpindex, 'Qscore'], label='True Positive Masses', shade=True, color='green')
+        sns.kdeplot(data=combined_df.loc[fpindex, 'Qscore'], label='False Positive Masses', shade=True, color='red')
+        sns.kdeplot(data=combined_df.loc[decoyindex, 'Qscore'], label='Decoy Masses', shade=True, color='blue')
+        plt.xlabel('Qscore')
+        plt.ylabel('Density')
+        plt.legend()
+        st.pyplot(fig_kde)
+        # Pie chart for true positives, false positives, and decoy masses
+        st.subheader('Pie Chart: True Positives, False Positives, Decoy Masses')
+        fig_pie, ax_pie = plt.subplots()
+        labels = ['True Positives', 'False Positives', 'Decoy Masses']
+        sizes = [tp_count, fp_count, decoy_count]
+        colors = ['green', 'red', 'blue']
+        ax_pie.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, startangle=90)
+        ax_pie.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+        st.pyplot(fig_pie)
+        ########################
+        ###########################
+        ##############
+        #######
+        # Calculate the mean Qvalue for bins of Qscore2D for true and decoy data
+        bin_means_true = true_positives.groupby(pd.cut(true_positives['Qscore2D'], np.arange(0, 1.05, 0.05)))[
+            'Qvalue'].mean()
+        bin_means_decoy = false_positives.groupby(pd.cut(false_positives['Qscore2D'], np.arange(0, 1.05, 0.05)))[
+            'Qvalue'].mean()
+
+        # Create the plot
+        fig, ax = plt.subplots(figsize=(10, 6))
+        # Line plot for the mean Qvalues
+        plt.plot(bin_means_true.index.categories.mid, bin_means_true.values, color='green',
+                 label='True FDR')
+        plt.plot(bin_means_decoy.index.categories.mid, bin_means_decoy.values, color='red', linestyle='dashed',
+                 label='Estimated FDR')
+
+        # Labeling
+        plt.xlabel('Qscore2D')
+        plt.ylabel('Qvalue')
+        plt.title('Score Distribution of Estimated FDR vs. True FDR')
+        plt.legend()
+        plt.grid(True)
+        st.pyplot(fig)
+      ##########
+
+        st.subheader('Distribution Plot: Different DecoyTypes')
+        fig_dist, ax_dist = plt.subplots(figsize=(10, 6))
+        sns.kdeplot(data=combined_df.loc[combined_df['TargetDecoyType'] == 1, 'Qscore'], label='Noise Decoys',
+                    shade=True)
+        sns.kdeplot(data=combined_df.loc[combined_df['TargetDecoyType'] == 2, 'Qscore'], label='Isotope Decoys',
+                    shade=True)
+        sns.kdeplot(data=combined_df.loc[combined_df['TargetDecoyType'] == 3, 'Qscore'], label='Charge Decoys',
+                    shade=True)
+        plt.xlabel('Qscore')
+        plt.ylabel('Density')
+        plt.legend()
+        st.pyplot(fig_dist)
+###############################################
+        def altair_histogram(data, title):
+            # Create the histogram
+            histogram = alt.Chart(data).mark_bar().encode(
+                alt.X('Qscore:Q', bin=True),
+                y='count()',
+                color='Type:N',
+                tooltip=['count()', 'mean(Qscore)']
+            ).properties(
+                title=title,
+                width=600,
+                height=400
+            ).interactive()
+
+            # Display the chart in Streamlit
+            st.altair_chart(histogram, use_container_width=True)
+
+################################################
+        ########################
+
+        # New Plot for Score Distribution testing 1
+        st.subheader('Score Distribution testing1 ')
+        fig, ax = plt.subplots(figsize=(10, 6))
+        # Filter for TargetDecoyType=0
+        target_data = combined_df[combined_df['TargetDecoyType'] == 0]
+        # Filter for TargetDecoyType>0 (Decoy Masses)
+        decoy_data = combined_df[combined_df['TargetDecoyType'] > 0]
+
+        # Plot for Target Masses
+        sns.scatterplot(x='Qscore2D', y='Qvalue', data=true_positives, ax=ax, color='green', label='True FDR')
+        # Plot for Decoy Masses
+        sns.scatterplot(x='Qscore2D', y='Qvalue', data=false_positives, ax=ax, color='red', label='Estimated FDR')
+
+        plt.xlabel('Qscore2D')
+        plt.ylabel('Qvalue')
+        plt.title('Score Distribution of Target vs. Decoy Masses')
+        plt.legend()
+        st.pyplot(fig)
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+
+    # Sidebar for file uploads
+# Function to load data from a given file path
+def load_data(file_path):
+    if os.path.exists(file_path):
+        return pd.read_csv(file_path)
+    else:
+        return pd.DataFrame()  # Return an empty DataFrame if the file doesn't exist
+
+# Sidebar for file uploads
+st.sidebar.header("File Uploads")
+combined_file = st.sidebar.file_uploader("Upload Combined File (CSV)", type=["csv"])
+original_file = st.sidebar.file_uploader("Upload Original File (CSV)", type=["csv"])
+
+# Sidebar for other options
+ppmtol = st.sidebar.slider("Set ppmtol", min_value=1, max_value=20, value=5)
+
+# Title
+st.title('FDR Estimation FLASH App 🚀')
+
+# Subheader for ppmtol
+st.subheader(f'Checkout distributions plots for different tolerance: {ppmtol} ppm Tolerance')
+
+# Paths for the example files
+combined_example_path = "/Users/ayeshaferoz/Downloads/Res35k,noise1e3,centroid/FLASHout/adder.csv"
+original_example_path = "/Users/ayeshaferoz/Downloads/chosen.csv"
+
+# Load example or uploaded data
+if combined_file is not None:
+    combined_df = pd.read_csv(combined_file)
+    st.write('Input file from FLASHDeconv :', combined_df)
+else:
+    combined_df = load_data(combined_example_path)
+    st.write('FLASHDeconv Example output File:', combined_df)
+
+if original_file is not None:
+    original_df = pd.read_csv(original_file)
+    st.write('True Mass List:', original_df)
+else:
+    original_df = load_data(original_example_path)
+    st.write('True Mass List:', original_df)
+
+# Check if dataframes are not empty and then generate plots
+if not combined_df.empty and not original_df.empty:
+    st.subheader('Generate Plots')
+    if st.button('Generate Plots'):
+        generate_plots(combined_df, original_df, ppmtol)
+# Information Section
+st.write('---')  # Horizontal line to separate sections
+st.header('Information')
+
+# Contact Us
+st.subheader('Contact Us')
+st.markdown("""
+- **Email**: [ayesha.feroz@hotmail.com](mailto:ayesha.feroz@hotmail.com)
+""")
+
+# Publications
+st.subheader('Publications')
+st.markdown("""
+- Jeong et al., 2020, Cell Systems 10, 213–218. February 26, 2020. A 2020 The Authors. Published by Elsevier Inc. [DOI](https://doi.org/10.1016/j.cels.2020.01.003)
+""")
